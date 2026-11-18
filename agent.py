@@ -4,7 +4,7 @@ CodeSentinel - language-agnostic AI code triage.
 
 Walks a directory, chunks every text file, and asks Claude to find
 security issues, code "slop", and coding gaps / loose ends.
-A tiny regex pass runs alongside it as an offline safety net.
+Deterministic AST + regex analyzers run alongside it as an offline safety net.
 
 Usage:
     python agent.py ./dummy_target
@@ -29,6 +29,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
+
+from analyzers import analyze_python
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -89,6 +91,8 @@ class Finding:
     detail: str = ""
     fix: str = ""
     source: str = "llm"   # llm | static
+    rule: str = ""
+    confidence: float = 0.0
 
 
 @dataclass
@@ -285,7 +289,7 @@ def analyze_chunk(client, model: str, rel: str, lang: str, chunk: Chunk) -> list
 
 
 # --------------------------------------------------------------------------- #
-# 4. Static safety net (regex) - works offline, deterministic
+# 4. Static safety net (AST + regex) - works offline, deterministic
 # --------------------------------------------------------------------------- #
 M = re.MULTILINE
 STATIC_RULES = [
@@ -321,6 +325,10 @@ STATIC_RULES = [
 
 def static_scan(rel: str, text: str) -> list[Finding]:
     out: list[Finding] = []
+    if rel.endswith(".py"):  # AST findings go first so they win ties in merge()
+        out += [Finding(rel, r.line, r.category, r.severity, r.title, r.detail,
+                        r.fix, "static", r.rule, r.confidence)
+                for r in analyze_python(rel, text)]
     for cat, sev, title, rx, fix in STATIC_RULES:
         for m in rx.finditer(text):
             line = text.count("\n", 0, m.start()) + 1
@@ -424,7 +432,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("target", help="Directory (or single file) to scan")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Anthropic model (default: {DEFAULT_MODEL})")
     ap.add_argument("--report", metavar="FILE", help="Also write a Markdown report to FILE")
-    ap.add_argument("--offline", action="store_true", help="Skip the LLM; run regex rules only")
+    ap.add_argument("--offline", action="store_true", help="Skip the LLM; run deterministic rules only")
     ap.add_argument("--workers", type=int, default=4, help="Parallel LLM requests (default 4)")
     ap.add_argument("--chunk-chars", type=int, default=CHUNK_CHARS)
     ap.add_argument("--max-files", type=int, default=MAX_FILES)
@@ -451,7 +459,7 @@ def main(argv=None) -> int:
 
     use_llm = not args.offline and bool(os.getenv("ANTHROPIC_API_KEY"))
     if not args.offline and not use_llm:
-        console.print("[yellow]ANTHROPIC_API_KEY not set - falling back to offline regex mode.[/]")
+        console.print("[yellow]ANTHROPIC_API_KEY not set - falling back to offline mode.[/]")
 
     start = time.time()
     findings: list[Finding] = []
@@ -491,13 +499,13 @@ def main(argv=None) -> int:
                         errors.append(f"{futs[fut]}: {type(exc).__name__}: {exc}")
                     prog.advance(task)
         if auth_failed:
-            console.print("[red]Invalid ANTHROPIC_API_KEY - results below are regex-only.[/]")
+            console.print("[red]Invalid ANTHROPIC_API_KEY - results below are rule-based only.[/]")
             use_llm = False
 
     merged = merge(findings)
     stats = {
         "files": len(files), "chunks": len(jobs), "elapsed": time.time() - start,
-        "mode": f"LLM ({args.model}) + regex" if use_llm else "offline regex",
+        "mode": f"LLM ({args.model}) + rules" if use_llm else "offline rules",
     }
     render_terminal(merged, stats)
     for e in errors[:5]:

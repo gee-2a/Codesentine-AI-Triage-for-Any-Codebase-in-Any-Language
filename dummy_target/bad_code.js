@@ -20,7 +20,7 @@ app.get('/ping', (req, res) => {
 app.get('/user', async (req, res) => {
   try {
     const q = `SELECT * FROM users WHERE id = ${req.query.id}`;
-    res.send(await db.query(q));
+    res.json(await db.query(q));
   } catch (e) {}
 });
 

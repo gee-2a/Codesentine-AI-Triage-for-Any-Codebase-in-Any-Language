@@ -37,6 +37,11 @@ class StaticScanTests(unittest.TestCase):
                          "Empty/swallowing exception handler", "TLS verification disabled"):
             self.assertIn(expected, t)
 
+    def test_python_demo_ast_rules(self):
+        text = (DEMO / "bad_code.py").read_text(encoding="utf-8")
+        rules = {f.rule for f in agent.static_scan("bad_code.py", text)}
+        self.assertTrue({"SLP003", "GAP001"} <= rules)
+
     def test_javascript_demo(self):
         t = self.titles("bad_code.js")
         for expected in ("Hardcoded credential", "Dynamic code execution (eval/exec)",
@@ -51,6 +56,11 @@ class MergeAndRedactTests(unittest.TestCase):
         merged = agent.merge([s, l])
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].source, "llm")
+
+    def test_ast_and_regex_duplicates_collapse_to_one(self):
+        text = "try:\n    x()\nexcept Exception:\n    pass\n"
+        merged = agent.merge(agent.static_scan("a.py", text))
+        self.assertEqual([f.line for f in merged if f.category == "gaps"], [3])
 
     def test_redact_hides_secrets(self):
         self.assertNotIn("IOSFODNN7", agent.redact("key AKIAIOSFODNN7EXAMPLE"))
@@ -80,6 +90,37 @@ class FileDiscoveryTests(unittest.TestCase):
             self.assertEqual(found, {"main.py", ".env"})
 
 
+class ClassifyTests(unittest.TestCase):
+    def test_billing(self):
+        self.assertEqual(app.classify_text("Please refund this invoice")["category"], "billing")
+
+    def test_technical(self):
+        self.assertEqual(app.classify_text("The screen is broken")["category"], "technical")
+
+    def test_account(self):
+        self.assertEqual(app.classify_text("I forgot my password")["category"], "account")
+
+    def test_urgency(self):
+        self.assertEqual(app.classify_text("Urgent outage")["urgency"], "high")
+        self.assertEqual(app.classify_text("Just a question")["urgency"], "low")
+
+    def test_unknown_is_general_with_valid_confidence(self):
+        result = app.classify_text("Hello team")
+        self.assertEqual(result["category"], "general")
+        self.assertTrue(0 <= result["confidence"] <= 1)
+
+
+class RateLimiterTests(unittest.TestCase):
+    def test_blocks_after_limit_then_recovers(self):
+        now = [0.0]
+        rl = app.RateLimiter(2, window=60, clock=lambda: now[0])
+        self.assertTrue(rl.allow("ip"))
+        self.assertTrue(rl.allow("ip"))
+        self.assertFalse(rl.allow("ip"))
+        now[0] = 61
+        self.assertTrue(rl.allow("ip"))
+
+
 class WebApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,28 +134,44 @@ class WebApiTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def post(self, body: bytes):
-        req = urllib.request.Request(self.base + "/api/scan", data=body,
+    def post(self, path, body: bytes):
+        req = urllib.request.Request(self.base + path, data=body,
                                      headers={"Content-Type": "application/json"})
         return urllib.request.urlopen(req)
 
     def test_health(self):
         with urllib.request.urlopen(self.base + "/health") as r:
-            self.assertEqual(json.load(r), {"status": "ok"})
+            self.assertEqual(json.load(r), {"ok": True})
 
-    def test_scan_offline(self):
+    def test_classify_ok(self):
+        with self.post("/classify", json.dumps({"text": "Refund my payment"}).encode()) as r:
+            data = json.load(r)
+        self.assertEqual(set(data), {"category", "urgency", "confidence"})
+        self.assertEqual(data["category"], "billing")
+
+    def test_classify_requires_text(self):
+        for body in (b'{"text": ""}', b'{"text": 5}', b'{}', b'[]'):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.post("/classify", body)
+            self.assertEqual(ctx.exception.code, 400)
+
+    def test_classify_invalid_json_is_400(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/classify", b"not json")
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_unknown_route_is_404(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/nope")
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_scan_offline_redacts_values(self):
         payload = {"filename": "bad.py", "offline": True,
                    "code": "# TODO fix\npassword = \"abcdef123\"\n"}
-        with self.post(json.dumps(payload).encode()) as r:
+        with self.post("/api/scan", json.dumps(payload).encode()) as r:
             raw = r.read().decode()
-        data = json.loads(raw)
-        self.assertGreaterEqual(len(data["findings"]), 2)
+        self.assertGreaterEqual(len(json.loads(raw)["findings"]), 2)
         self.assertNotIn("abcdef123", raw)
-
-    def test_bad_json_is_400(self):
-        with self.assertRaises(urllib.error.HTTPError) as ctx:
-            self.post(b"not json")
-        self.assertEqual(ctx.exception.code, 400)
 
 
 if __name__ == "__main__":

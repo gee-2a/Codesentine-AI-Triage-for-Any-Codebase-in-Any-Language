@@ -2,65 +2,56 @@
 
 **Language-agnostic AI code triage.** Point it at any folder, in any language, and it reports security risks, code slop, and loose ends, each with an exact `file:line`, a severity and a suggested fix.
 
-- **Security:** hardcoded secrets, injection, `eval`/`exec`, disabled TLS verification, debug mode, insecure configs
-- **Slop:** dead code, unused imports/variables, deep nesting, duplication, bad formatting
-- **Gaps:** TODO/FIXME, empty catch blocks, unhandled errors, missing tests, stubs
+- **Security:** hardcoded secrets, injection, `eval`/`exec`, disabled TLS verification, debug mode
+- **Slop:** dead code, unused imports, duplicated functions, stubs, commented-out code
+- **Gaps:** TODO/FIXME, swallowed exceptions, tests without assertions, missing tests
 
-It ships as a **CLI** (terminal summary or Markdown report) and a **web demo** (paste code, get findings).
-
----
+It ships as a **CLI** (terminal summary or Markdown report) and a **web service** (JSON API plus a paste-and-scan UI).
 
 ## Table of contents
 1. [Quick start](#quick-start)
-2. [Usage](#usage)
-3. [Web demo and API](#web-demo-and-api)
-4. [Architecture](#architecture)
-5. [Running tests](#running-tests)
-6. [Docker (optional)](#docker-optional)
+2. [CLI usage](#cli-usage)
+3. [Web service and API](#web-service-and-api)
+4. [Analysis rules](#analysis-rules)
+5. [Architecture](#architecture)
+6. [Tests and CI](#tests-and-ci)
 7. [Project structure](#project-structure)
 8. [Configuration](#configuration)
 9. [Limitations and privacy](#limitations-and-privacy)
-
----
 
 ## Quick start
 
 Requires Python 3.10+.
 
 ```bash
-# 1. Install
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install -r requirements.txt
 
-# 2. Run the bundled demo (no API key needed)
-python agent.py ./dummy_target --offline
+python agent.py ./dummy_target --offline    # no API key needed
 ```
 
-To enable full AI analysis, add your Anthropic API key and drop `--offline`:
+For AI analysis, add your Anthropic API key and drop `--offline`:
 
 ```bash
 echo "ANTHROPIC_API_KEY=sk-ant-your-key" > .env
 python agent.py ./dummy_target
 ```
 
-With no key, or an invalid one, the agent falls back to offline regex mode automatically instead of crashing.
+With no key, or an invalid one, the agent falls back to offline mode instead of crashing.
 
----
-
-## Usage
+## CLI usage
 
 ```bash
-python agent.py ./dummy_target                      # colorized terminal summary
-python agent.py ./my_repo --report report.md        # also write a Markdown report
-python agent.py ./my_repo --fail-on high            # exit code 1 if high/critical found (CI)
-python agent.py ./my_repo --offline                 # regex rules only, no API key
-python agent.py ./my_repo --model claude-sonnet-5-5 # choose a model
+python agent.py ./my_repo                      # colorized terminal summary
+python agent.py ./my_repo --report report.md   # also write a Markdown report
+python agent.py ./my_repo --fail-on high       # exit 1 if high/critical found (CI)
+python agent.py ./my_repo --offline            # deterministic rules only
 ```
 
 | Flag | Purpose | Default |
 |---|---|---|
-| `--offline` | Skip the LLM and run regex rules only | off |
+| `--offline` | Skip the LLM; use deterministic rules only | off |
 | `--report FILE` | Also write a Markdown report | none |
 | `--fail-on LEVEL` | Exit 1 at/above `critical\|high\|medium\|low` | `none` |
 | `--model NAME` | Anthropic model (or set `ANTHROPIC_MODEL`) | `claude-sonnet-5-5` |
@@ -68,116 +59,99 @@ python agent.py ./my_repo --model claude-sonnet-5-5 # choose a model
 | `--chunk-chars N` | Characters of code per request | 12000 |
 | `--max-files N` / `--max-file-kb N` | Cost and size guards | 200 / 300 |
 
----
-
-## Web demo and API
+## Web service and API
 
 ```bash
-python app.py        # then open http://localhost:8000
+python app.py        # http://localhost:8000
 ```
-
-The server uses only the Python standard library and listens on port 8000 (override with the `PORT` environment variable).
 
 | Endpoint | Description |
 |---|---|
 | `GET /` | Web UI: paste code, click **Scan** |
-| `GET /health` | Returns `{"status": "ok"}` |
-| `POST /api/scan` | Scan a snippet and return JSON findings |
+| `GET /health` | Returns `{"ok": true}` |
+| `POST /classify` | `{"text": "..."}` returns `{"category", "urgency", "confidence"}` (deterministic keyword triage) |
+| `POST /api/scan` | `{"filename", "code", "offline"}` returns scan findings |
 
 ```bash
-curl -s localhost:8000/api/scan \
-  -H "Content-Type: application/json" \
-  -d '{"filename":"demo.py","offline":true,"code":"# TODO fix\npassword = \"abcdef123\"\n"}'
+curl -s localhost:8000/classify -H "Content-Type: application/json" \
+  -d '{"text":"Urgent: payment failed, please refund"}'
 ```
 
-The response contains `mode`, `score` (0-100 health score) and a `findings` list. The web demo is offline (regex) by default. AI analysis runs only if you tick the box and the server has `ANTHROPIC_API_KEY`. Request bodies are capped at 200 KB.
+Requests are rate-limited per client IP (`RATE_LIMIT_PER_MIN`, default 300) and return `429` when exceeded. Bodies are size-capped (16 KB for `/classify`, 200 KB for `/api/scan`), client sockets time out after 5 seconds, and request contents are never logged. The web service uses only the Python standard library for serving; AI analysis in `/api/scan` runs only if the request asks for it and the server has `ANTHROPIC_API_KEY`.
 
----
+## Analysis rules
+
+Python files get deterministic, offline AST analysis (no API key needed). Every finding has a rule ID, severity, confidence and evidence.
+
+| Rule | Category | Detects |
+|---|---|---|
+| SLP001 | Slop | Functions identical after renaming (duplicates) |
+| SLP002 | Slop | Unreachable statements, uncalled private functions |
+| SLP003 | Slop | Unused imports |
+| SLP004 | Slop | Comment blocks that parse as code |
+| SLP005 | Slop | Stub bodies (`pass`, `...`, `NotImplementedError`) |
+| GAP001 | Gaps | Exceptions swallowed silently |
+| GAP003 | Gaps | Test functions with no meaningful assertions |
+
+All languages additionally get regex rules (secrets, `eval`/`exec`, SQL string-building, TLS verification off, debug mode, TODO/FIXME, empty catch) and, when an API key is set, Claude's semantic analysis.
 
 ## Architecture
 
 ```
  local dir ──► pathlib walker ──► line-numbered chunker ──► Claude (forced tool call) ──┐
  (skips hidden,   (text only,      (12k chars, gutter          structured JSON findings  │
-  binaries,        size-capped)     "  42| code")                                        ├─► merge + dedupe ─► terminal / Markdown / JSON
-  node_modules)                          │                                              │   + health score
-                                         └──► regex safety net (offline, deterministic) ┘
+  binaries,        size-capped)     "  42| code")                                        │
+  node_modules)                          │                                              ├─► merge + dedupe ─► terminal / Markdown / JSON
+                                         ├──► Python AST analyzers (offline) ───────────┤   + health score
+                                         └──► regex rules (offline) ────────────────────┘
 ```
 
-**Why it stays language-agnostic**
-1. **No AST, no parsers.** The walker only decides whether a file is readable text (null-byte sniff, extension denylist, size cap). It never needs to know the language.
-2. **Line-numbered chunks.** Files are split on line boundaries and each line is prefixed with its absolute number, so the model can cite exact locations in any language.
-3. **Semantic analysis by Claude.** A strict system prompt defines three categories (security, slop, gaps) and a severity rubric. Output is forced through a tool-call JSON schema, so there is no fragile text parsing.
-4. **Regex safety net.** A small local rule set runs alongside the LLM, so results appear instantly offline and cover the LLM's blind spots. Duplicates are merged and LLM findings win.
-5. **Safety by design.** Scanned code is treated as untrusted data (prompt-injection guard), secret values are redacted from reports, and hidden folders, lockfiles and binaries are never sent.
+1. **No per-language parsers required.** The walker only decides whether a file is readable text, so any language can be scanned.
+2. **Line-numbered chunks** let the model cite exact locations.
+3. **Structured LLM output** through a forced tool call, so there is no fragile text parsing.
+4. **Deterministic layers** (AST + regex) work offline and back up the LLM. Duplicates are merged, and AST findings win ties.
+5. **Safety:** scanned code is treated as untrusted data (prompt-injection guard), and secret values are redacted from reports.
 
----
-
-## Running tests
+## Tests and CI
 
 ```bash
 python -m unittest discover -v
 ```
 
-The tests cover chunking, the regex rules against the demo files, merge and redaction, file discovery (hidden, binary and vendor files skipped), and the web API.
-
----
-
-## Docker (optional)
-
-```bash
-docker build -t codesentinel .
-
-# CLI demo (no key needed)
-docker run --rm -it codesentinel dummy_target --offline
-
-# With AI analysis
-docker run --rm -it --env-file .env codesentinel
-
-# Scan your own code and save a report
-mkdir -p reports
-docker run --rm -it --env-file .env \
-  -v "$(pwd)/path/to/repo:/scan:ro" -v "$(pwd)/reports:/out" \
-  codesentinel /scan --report /out/report.md
-
-# Web demo
-docker run --rm -p 8000:8000 --entrypoint python codesentinel app.py
-```
-
----
+36 tests cover chunking, file discovery, the regex rules, every AST rule, merging and redaction, the classifier, the rate limiter and the HTTP API. GitHub Actions runs the same command on every push (`.github/workflows/ci.yml`).
 
 ## Project structure
 
 ```
 .
-├── agent.py            # CLI scanner: walker, chunker, LLM + regex analysis, reports
-├── app.py              # web demo and JSON API (stdlib, port 8000)
-├── test_agent.py       # unit tests
-├── arena.json          # hackathon runner config (install / test / start / port)
-├── AI_LOG.md           # how AI was used to build this project
+├── agent.py             # CLI scanner: walker, chunker, LLM + regex analysis, reports
+├── analyzers.py         # offline Python AST analyzers (rules SLP/GAP)
+├── app.py               # web service: /health, /classify, /api/scan, UI
+├── test_agent.py        # tests: scanner, classifier, rate limiter, HTTP API
+├── test_analyzers.py    # tests: AST analyzers
+├── arena.json           # hackathon runner config (install / test / start / port)
+├── requirements.txt     # pinned dependencies
 ├── README.md
-├── requirements.txt    # anthropic, rich, python-dotenv
-├── Dockerfile
-└── dummy_target/       # deliberately bad demo files (all secrets are fake)
+├── AI_LOG.md            # how AI was used to build this project
+├── .github/workflows/ci.yml
+└── dummy_target/        # deliberately bad demo files (all secrets are fake)
     ├── bad_code.py
     └── bad_code.js
 ```
-
----
 
 ## Configuration
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Enables AI analysis. Set it in the environment or a `.env` file. Never commit `.env`. |
+| `ANTHROPIC_API_KEY` | Enables AI analysis (environment or `.env`; never commit `.env`) |
 | `ANTHROPIC_MODEL` | Override the default model |
-| `PORT` | Web demo port (default 8000) |
-
----
+| `PORT` | Web service port (default 8000) |
+| `RATE_LIMIT_PER_MIN` | Per-IP request limit (default 300) |
 
 ## Limitations and privacy
 
-- Full semantic analysis needs an Anthropic API key. Without one, only the regex rules run.
-- In AI mode, scanned source text is sent to the Anthropic API. Don't scan code you aren't allowed to share, or use `--offline` for a fully local run.
-- Regex rules are heuristics and can miss patterns or flag false positives. Treat results as triage, not a verdict.
+- AST analysis covers Python only. Other languages rely on regex rules and the LLM.
+- Full semantic analysis needs an Anthropic API key. In AI mode, scanned source text is sent to the Anthropic API, so use `--offline` for code you can't share.
+- Rules are heuristics and can miss patterns or flag false positives. Treat results as triage, not a verdict.
+- `/classify` is a deterministic keyword classifier, not a trained model.
 - Large repos are capped by `--max-files` and `--max-file-kb` to control cost.
