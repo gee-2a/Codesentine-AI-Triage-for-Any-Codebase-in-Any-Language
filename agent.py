@@ -22,15 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-import anthropic
-from dotenv import load_dotenv
-from rich import box
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
-from rich.table import Table
-
 from analyzers import analyze_python
+from env_loader import load_env_file
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -74,9 +67,6 @@ SEV_STYLE = {
 }
 SEV_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
 CAT_LABEL = {"security": "Security", "slop": "Slop", "gaps": "Gaps"}
-
-console = Console()
-
 
 # --------------------------------------------------------------------------- #
 # Data model
@@ -367,6 +357,12 @@ def risk_score(findings: list[Finding]) -> int:
 
 
 def render_terminal(findings: list[Finding], stats: dict) -> None:
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
     score = risk_score(findings)
     color = "green" if score >= 80 else "yellow" if score >= 50 else "red"
     counts = {s: sum(f.severity == s for f in findings) for s in SEVERITIES}
@@ -443,7 +439,11 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def main(argv=None) -> int:
-    load_dotenv()
+    from rich.console import Console
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
+    load_env_file()
+    console = Console()
     args = parse_args(argv)
     target = Path(args.target).expanduser().resolve()
     if not target.exists():
@@ -482,6 +482,8 @@ def main(argv=None) -> int:
     console.print(f"[bold]Scanning[/] {target}  ->  {len(files)} files, {len(jobs)} chunks")
     errors: list[str] = []
     if use_llm:
+        import anthropic
+
         client = anthropic.Anthropic(max_retries=3)
         auth_failed = False
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),

@@ -13,7 +13,7 @@ const app = express();
 app.get('/ping', (req, res) => {
   const unusedVar = 42;
   exec('ping -c 1 ' + req.query.host, (err, out) => {
-    res.send(out);
+    res.json({ output: out });
   });
 });
 

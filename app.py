@@ -18,10 +18,8 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import anthropic
-from dotenv import load_dotenv
-
 import agent
+from env_loader import load_env_file
 
 MAX_CLASSIFY_BODY = 16_384
 MAX_SCAN_BODY = 200_000
@@ -152,6 +150,8 @@ def scan_code(filename: str, code: str, want_llm: bool) -> dict:
     mode = "offline rules"
     if want_llm and os.getenv("ANTHROPIC_API_KEY"):
         try:
+            import anthropic
+
             client = anthropic.Anthropic(max_retries=2)
             lang = agent.LANG_BY_EXT.get(Path(rel).suffix.lower(), "unknown (infer from content)")
             for chunk in agent.chunk_text(code):
@@ -250,7 +250,7 @@ def make_server(host: str = "0.0.0.0", port: int = 8000) -> ThreadingHTTPServer:
 
 
 if __name__ == "__main__":
-    load_dotenv()
+    load_env_file()
     port = int(os.getenv("PORT", "8000"))
     print(f"CodeSentinel listening on http://localhost:{port}")
     make_server(port=port).serve_forever()
