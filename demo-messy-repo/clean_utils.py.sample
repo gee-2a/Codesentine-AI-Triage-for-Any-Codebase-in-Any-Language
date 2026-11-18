@@ -1,0 +1,29 @@
+"""Small, correct helpers: nothing here should be flagged."""
+import hashlib
+import json
+import logging
+
+import requests
+
+log = logging.getLogger(__name__)
+
+
+def find_item(db, name):
+    return db.execute("SELECT * FROM items WHERE name = ?", (name,)).fetchall()
+
+
+def checksum(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def fetch(url):
+    return requests.get(url, timeout=10).json()
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError:
+        log.exception("could not read %s", path)
+        return {}

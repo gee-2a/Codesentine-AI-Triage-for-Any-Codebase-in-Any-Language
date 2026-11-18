@@ -47,12 +47,18 @@ python agent.py ./my_repo                      # colorized terminal summary
 python agent.py ./my_repo --report report.md   # also write a Markdown report
 python agent.py ./my_repo --fail-on high       # exit 1 if high/critical found (CI)
 python agent.py ./my_repo --offline            # deterministic rules only
+python agent.py ./my_repo --offline --format sarif > out.sarif   # SARIF 2.1.0 for code scanning
+python agent.py ./my_repo --fix                # dry run: show verified fixes as diffs
+python agent.py ./my_repo --fix --apply        # write the verified fixes to disk
 ```
 
 | Flag | Purpose | Default |
 |---|---|---|
 | `--offline` | Skip the LLM; use deterministic rules only | off |
 | `--report FILE` | Also write a Markdown report | none |
+| `--format text\|json\|sarif` | Output on stdout (json/sarif keep stdout machine-readable) | `text` |
+| `--exclude GLOBS` | Comma-separated paths/globs to skip, e.g. `tests,*.md` | none |
+| `--fix` / `--apply` | Show / write verified fixes for Python files | off |
 | `--fail-on LEVEL` | Exit 1 at/above `critical\|high\|medium\|low` | `none` |
 | `--model NAME` | Anthropic model (or set `ANTHROPIC_MODEL`) | `claude-sonnet-5-5` |
 | `--workers N` | Parallel LLM requests | 4 |
@@ -85,15 +91,34 @@ Python files get deterministic, offline AST analysis (no API key needed). Every 
 
 | Rule | Category | Detects |
 |---|---|---|
+| SEC002 | Security | MD5/SHA-1, unverified SSL contexts |
+| SEC003 | Security | `eval`/`exec`, `os.system`, `shell=True`, unsafe deserialization |
+| SEC004 | Security | SQL built with concatenation, f-strings, `%` or `.format` |
 | SLP001 | Slop | Functions identical after renaming (duplicates) |
 | SLP002 | Slop | Unreachable statements, uncalled private functions |
 | SLP003 | Slop | Unused imports |
 | SLP004 | Slop | Comment blocks that parse as code |
 | SLP005 | Slop | Stub bodies (`pass`, `...`, `NotImplementedError`) |
 | GAP001 | Gaps | Exceptions swallowed silently |
+| GAP002 | Gaps | Network calls (`requests`, `httpx`, `urlopen`) without a timeout |
 | GAP003 | Gaps | Test functions with no meaningful assertions |
+| DEP002 | Slop | Import that is not stdlib, not local and not in `requirements*.txt` (only when a manifest exists) |
 
-All languages additionally get regex rules (secrets, `eval`/`exec`, SQL string-building, TLS verification off, debug mode, TODO/FIXME, empty catch) and, when an API key is set, Claude's semantic analysis.
+On Python files the AST rules replace the regex versions of SEC003, SEC004 and GAP001, so strings and comments that merely mention `eval` or `shell=True` are not flagged. All languages additionally get regex rules (secrets, `eval`/`exec`, SQL string-building, TLS verification off, debug mode, TODO/FIXME, empty catch) and, when an API key is set, Claude's semantic analysis.
+
+### Suppressions
+
+Silence a finding on its own line, or on the line above it, with a rule ID and a **reason**:
+
+```python
+os.system(cmd)  # sentinel:ignore[SEC003] cmd is a constant from our config
+```
+
+JS/Go/Java use `//`. A suppression without a reason suppresses nothing and is reported as `SUP001`. The suppressed count appears in every report.
+
+### Verified fixes
+
+`--fix` handles Python only: unused imports, unreachable code, commented-out code, `verify=False`, and `except: pass` (replaced with a logged exception). A patch is kept only if the result still parses, the targeted finding is gone, and no rule has more findings than before. Rejected patches are listed with the reason. Without `--apply` nothing is written.
 
 ## Architecture
 
@@ -118,17 +143,25 @@ All languages additionally get regex rules (secrets, `eval`/`exec`, SQL string-b
 python -m unittest discover -v
 ```
 
-36 tests cover chunking, file discovery, the regex rules, every AST rule, merging and redaction, the classifier, the rate limiter and the HTTP API. GitHub Actions runs the same command on every push (`.github/workflows/ci.yml`).
+58 tests cover chunking, file discovery, the regex and AST rules, suppressions, JSON/SARIF output, the fixers, the benchmark, merging and redaction, the classifier, the rate limiter and the HTTP API. See [BENCHMARK.md](BENCHMARK.md) and [SELF_AUDIT.md](SELF_AUDIT.md) for what the benchmark and the self-scan do and do not show. GitHub Actions runs the same command on every push (`.github/workflows/ci.yml`).
 
 ## Project structure
 
 ```
 .
 ├── agent.py             # CLI scanner: walker, chunker, LLM + regex analysis, reports
-├── analyzers.py         # offline Python AST analyzers (rules SLP/GAP)
+├── analyzers.py         # offline Python AST analyzers (rules SEC/SLP/GAP/DEP)
+├── suppress.py          # sentinel:ignore[RULE] reason parsing
+├── report.py            # JSON and SARIF 2.1.0 output
+├── fixers.py            # verified auto-fixes (--fix / --apply)
+├── scripts/evaluate.py  # precision / recall / F1 on the seeded benchmark
+├── demo-messy-repo/     # seeded benchmark (.sample files) + expected.json
 ├── app.py               # web service: /health, /classify, /api/scan, UI
 ├── test_agent.py        # tests: scanner, classifier, rate limiter, HTTP API
 ├── test_analyzers.py    # tests: AST analyzers
+├── test_extensions.py   # tests: new rules, suppressions, reports, fixers, benchmark
+├── BENCHMARK.md         # benchmark method and honest caveats
+├── SELF_AUDIT.md        # CodeSentinel scanning its own source
 ├── arena.json           # hackathon runner config (install / test / start / port)
 ├── requirements.txt     # pinned dependencies
 ├── README.md
@@ -150,7 +183,7 @@ python -m unittest discover -v
 
 ## Limitations and privacy
 
-- AST analysis covers Python only. Other languages rely on regex rules and the LLM.
+- AST analysis and `--fix` cover Python only. There is no taint tracking, so SEC003/SEC004 are pattern-level, not data-flow. Other languages rely on regex rules and the LLM.
 - Full semantic analysis needs an Anthropic API key. In AI mode, scanned source text is sent to the Anthropic API, so use `--offline` for code you can't share.
 - Rules are heuristics and can miss patterns or flag false positives. Treat results as triage, not a verdict.
 - `/classify` is a deterministic keyword classifier, not a trained model.

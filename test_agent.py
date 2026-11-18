@@ -32,10 +32,12 @@ class StaticScanTests(unittest.TestCase):
 
     def test_python_demo(self):
         t = self.titles("bad_code.py")
-        for expected in ("Hardcoded credential", "AWS access key ID",
-                         "Dynamic code execution (eval/exec)", "TODO/FIXME marker",
-                         "Empty/swallowing exception handler", "TLS verification disabled"):
+        for expected in ("Hardcoded credential", "AWS access key ID", "TODO/FIXME marker",
+                         "TLS verification disabled"):
             self.assertIn(expected, t)
+        # eval and the swallowed exception are reported by the AST rules on Python files
+        self.assertTrue(any("Dynamic code execution" in x for x in t))
+        self.assertTrue(any("Exception swallowed" in x for x in t))
 
     def test_python_demo_ast_rules(self):
         text = (DEMO / "bad_code.py").read_text(encoding="utf-8")

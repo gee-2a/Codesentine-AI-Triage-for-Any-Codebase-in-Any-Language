@@ -4,13 +4,18 @@ No network, no API key, no extra dependencies. Every finding carries a rule ID
 and a confidence score so results are reproducible and explainable.
 
 Rules
+    SEC002 weak-crypto           MD5/SHA1 hashes, unverified SSL contexts
+    SEC003 dangerous-sink        eval/exec, os.system, shell=True, unsafe deserialization
+    SEC004 sql-injection         string-built SQL passed to execute-like calls
     SLP001 duplicate-code        functions with equal normalized AST
     SLP002 dead-code             unreachable statements, uncalled private functions
     SLP003 unused-import         imports never referenced
     SLP004 commented-out-code    comment blocks that parse as code
     SLP005 stub-body             pass / ... / NotImplementedError / dummy return
     GAP001 empty-catch           except blocks that swallow the error
+    GAP002 no-timeout            network calls without a timeout
     GAP003 empty-test            test functions without meaningful assertions
+    DEP002 undeclared-import     import not stdlib, not local, not in a manifest
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import copy
 import hashlib
 import io
 import re
+import sys
 import textwrap
 import tokenize
 from typing import NamedTuple
@@ -34,6 +40,7 @@ class Raw(NamedTuple):
     detail: str
     fix: str
     confidence: float  # 0.0 - 1.0
+    end_line: int = 0  # last line of the finding's span (0 = same as line)
 
 
 _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -105,7 +112,8 @@ def _dead_code(tree: ast.Module) -> list[Raw]:
                         "SLP002", nxt.lineno, "slop", "medium", "[SLP002] Unreachable code",
                         f"This statement follows `{type(stmt).__name__.lower()}` "
                         f"(line {stmt.lineno}) and can never run.",
-                        "Delete the unreachable statements.", 0.95))
+                        "Delete the unreachable statements.", 0.95,
+                        stmts[-1].end_lineno or nxt.lineno))
                     break
     private = [n for n in tree.body if isinstance(n, _FUNCS)
                and n.name.startswith("_") and not n.name.startswith("__")]
@@ -248,7 +256,7 @@ def _fingerprint(fn: ast.AST) -> str:
     clone.body = rest or [ast.Pass()]
     clone.name = "f"
     _Normalizer().visit(clone)
-    return hashlib.sha1(ast.dump(clone, annotate_fields=False).encode()).hexdigest()
+    return hashlib.sha1(ast.dump(clone, annotate_fields=False).encode(), usedforsecurity=False).hexdigest()
 
 
 def _duplicates(tree: ast.Module) -> list[Raw]:
@@ -299,7 +307,7 @@ def _commented_code(text: str) -> list[Raw]:
             continue
         try:
             parsed = ast.parse(source)
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError):  # sentinel:ignore[GAP001] unparsable comment block is simply not code
             continue
         if any(isinstance(n, _CODEISH)
                or (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call))
@@ -307,14 +315,163 @@ def _commented_code(text: str) -> list[Raw]:
             out.append(Raw("SLP004", block[0][0], "slop", "low",
                            "[SLP004] Commented-out code",
                            f"{len(block)} comment line(s) parse as valid Python.",
-                           "Delete it; version control keeps the history.", 0.7))
+                           "Delete it; version control keeps the history.", 0.7,
+                           block[-1][0]))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# SEC002 / SEC003 / SEC004 / GAP002  call-based rules
+# --------------------------------------------------------------------------- #
+_SQL_WORDS = re.compile(r"(?is)\b(select|insert|update|delete)\b.*\b(from|into|set|where|values)\b")
+_EXECUTE_ATTRS = {"execute", "executemany", "executescript", "raw", "read_sql", "read_sql_query"}
+_HTTP_CALLS = {
+    "requests.get", "requests.post", "requests.put", "requests.patch", "requests.delete",
+    "requests.head", "requests.request", "urllib.request.urlopen",
+    "httpx.get", "httpx.post", "httpx.put", "httpx.patch", "httpx.delete", "httpx.request",
+}
+
+
+def _dotted(node: ast.AST) -> str:
+    """'a.b.c' for a Name/Attribute chain, '' for anything else."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _kwarg(call: ast.Call, name: str) -> ast.keyword | None:
+    return next((k for k in call.keywords if k.arg == name), None)
+
+
+def _is_true(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _is_dynamic_sql(arg: ast.AST) -> bool:
+    """True if `arg` is a string built from non-constant parts and looks like SQL."""
+    if isinstance(arg, ast.JoinedStr):
+        dynamic = any(isinstance(n, ast.FormattedValue) for n in ast.walk(arg))
+    elif isinstance(arg, ast.BinOp) and isinstance(arg.op, (ast.Add, ast.Mod)):
+        dynamic = any(isinstance(n, (ast.Name, ast.Attribute, ast.Subscript, ast.Call))
+                      for n in ast.walk(arg))
+    elif (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute)
+          and arg.func.attr == "format"):
+        dynamic = any(not isinstance(a, ast.Constant) for a in arg.args) or bool(arg.keywords)
+    else:
+        return False
+    texts = [n.value for n in ast.walk(arg)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    return dynamic and any(_SQL_WORDS.search(t) for t in texts)
+
+
+def _call_rules(tree: ast.Module) -> list[Raw]:
+    out: list[Raw] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _dotted(node.func)
+        line = node.lineno
+        attr = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+
+        if name in {"eval", "exec"}:
+            literal = bool(node.args) and isinstance(node.args[0], ast.Constant)
+            out.append(Raw("SEC003", line, "security", "medium" if literal else "high",
+                           f"[SEC003] Dynamic code execution ({name})",
+                           f"`{name}` runs arbitrary code" + (" (literal argument)." if literal
+                                                             else " built at runtime."),
+                           "Use ast.literal_eval or an explicit dispatch table.",
+                           0.5 if literal else 0.9))
+        elif name in {"os.system", "os.popen"}:
+            out.append(Raw("SEC003", line, "security", "high", f"[SEC003] Shell command via {name}",
+                           "The command string is interpreted by a shell.",
+                           "Use subprocess.run with an argument list and no shell.", 0.85))
+        elif name.startswith("subprocess.") and (kw := _kwarg(node, "shell")) and _is_true(kw.value):
+            out.append(Raw("SEC003", line, "security", "high", "[SEC003] subprocess with shell=True",
+                           "shell=True lets metacharacters in arguments run extra commands.",
+                           "Pass an argument list and drop shell=True.", 0.9))
+        elif name in {"pickle.load", "pickle.loads", "marshal.load", "marshal.loads"} or (
+                name == "yaml.load" and _kwarg(node, "Loader") is None):
+            out.append(Raw("SEC003", line, "security", "medium", f"[SEC003] Unsafe deserialization ({name})",
+                           "Deserializing untrusted data can execute code.",
+                           "Use json or yaml.safe_load for untrusted input.", 0.7))
+        elif name in {"hashlib.md5", "hashlib.sha1"}:
+            kw = _kwarg(node, "usedforsecurity")
+            if not (kw and isinstance(kw.value, ast.Constant) and kw.value.value is False):
+                out.append(Raw("SEC002", line, "security", "medium",
+                               f"[SEC002] Weak hash ({name.split('.')[1].upper()})",
+                               "MD5/SHA-1 are broken for security purposes.",
+                               "Use hashlib.sha256 (or pass usedforsecurity=False for checksums).",
+                               0.7))
+        elif name == "ssl._create_unverified_context":
+            out.append(Raw("SEC002", line, "security", "medium", "[SEC002] Unverified SSL context",
+                           "Certificates are not validated.", "Use ssl.create_default_context().", 0.9))
+
+        if attr in _EXECUTE_ATTRS and node.args and _is_dynamic_sql(node.args[0]):
+            out.append(Raw("SEC004", line, "security", "high", "[SEC004] SQL built from strings",
+                           "The query is assembled with concatenation/formatting, so input can alter it.",
+                           "Use parameterized queries (placeholders plus a parameter tuple).", 0.8))
+
+        if name in _HTTP_CALLS and _kwarg(node, "timeout") is None and not any(
+                k.arg is None for k in node.keywords):
+            out.append(Raw("GAP002", line, "gaps", "medium", f"[GAP002] {name} has no timeout",
+                           "Without a timeout the call can hang forever.",
+                           "Pass timeout=<seconds>.", 0.75))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# DEP002 undeclared imports (needs repo context: local modules + manifest)
+# --------------------------------------------------------------------------- #
+_ALIASES = {
+    "dotenv": "python-dotenv", "yaml": "pyyaml", "cv2": "opencv-python", "pil": "pillow",
+    "sklearn": "scikit-learn", "bs4": "beautifulsoup4", "dateutil": "python-dateutil",
+    "jwt": "pyjwt", "serial": "pyserial", "attr": "attrs",
+}
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _undeclared_imports(tree: ast.Module, ctx: dict | None) -> list[Raw]:
+    if not ctx or ctx.get("declared") is None:
+        return []
+    stdlib = getattr(sys, "stdlib_module_names", None)
+    if stdlib is None:
+        return []
+    declared = {_norm(d) for d in ctx["declared"]}
+    local = ctx.get("local", set())
+    out: list[Raw] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        tops: list[str] = []
+        if isinstance(node, ast.Import):
+            tops = [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            tops = [node.module.split(".")[0]]
+        for top in tops:
+            if top in stdlib or top in local or top in seen:
+                continue
+            if {_norm(top), _norm(_ALIASES.get(top.lower(), top))} & declared:
+                continue
+            seen.add(top)
+            out.append(Raw("DEP002", node.lineno, "slop", "low",
+                           f"[DEP002] Import '{top}' is not declared in a manifest",
+                           "Not stdlib, not a local module, and not listed in requirements.",
+                           "Add it to requirements.txt, or remove the import if it does not exist.",
+                           0.4))
     return out
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
-def analyze_python(rel: str, text: str) -> list[Raw]:
+def analyze_python(rel: str, text: str, ctx: dict | None = None) -> list[Raw]:
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError) as exc:
@@ -326,4 +483,5 @@ def analyze_python(rel: str, text: str) -> list[Raw]:
         findings += check(tree, rel)
     findings += _dead_code(tree) + _stubs(tree) + _empty_catches(tree)
     findings += _duplicates(tree) + _commented_code(text)
+    findings += _call_rules(tree) + _undeclared_imports(tree, ctx)
     return sorted(findings, key=lambda r: (r.line, r.rule))

@@ -1,0 +1,20 @@
+{
+  "tolerance_lines": 1,
+  "expected": [
+    {"file": "inventory.py", "line": 9,  "rule": "SEC004"},
+    {"file": "inventory.py", "line": 13, "rule": "SEC003"},
+    {"file": "inventory.py", "line": 17, "rule": "SEC002"},
+    {"file": "inventory.py", "line": 21, "rule": "GAP002"},
+    {"file": "inventory.py", "line": 28, "rule": "GAP001"},
+    {"file": "inventory.py", "line": 33, "rule": "SLP002"},
+    {"file": "inventory.py", "line": 37, "rule": "SLP004"},
+    {"file": "inventory.py", "line": 41, "rule": "SLP005"},
+    {"file": "inventory.py", "line": 2,  "rule": "SLP003"},
+    {"file": "inventory.py", "line": 3,  "rule": "SLP003"},
+    {"file": "helpers.js",   "line": 3,  "rule": "SEC001"},
+    {"file": "helpers.js",   "line": 5,  "rule": "GAP004"},
+    {"file": "helpers.js",   "line": 7,  "rule": "SEC003"},
+    {"file": "helpers.js",   "line": 14, "rule": "GAP001"}
+  ],
+  "clean_files": ["clean_utils.py", "clean_service.js"]
+}

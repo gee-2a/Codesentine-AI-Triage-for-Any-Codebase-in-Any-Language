@@ -1,0 +1,15 @@
+const express = require("express");
+const app = express();
+const API_KEY = "example-placeholder-not-a-credential";
+
+// TODO: add auth
+app.get("/run", (req, res) => {
+  const out = eval(req.query.expr);
+  res.send(String(out));
+});
+
+function save(file) {
+  try {
+    write(file);
+  } catch (e) {}
+}

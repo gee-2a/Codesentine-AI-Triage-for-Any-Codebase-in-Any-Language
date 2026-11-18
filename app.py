@@ -19,7 +19,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import agent
-from env_loader import load_env_file
 
 MAX_CLASSIFY_BODY = 16_384
 MAX_SCAN_BODY = 200_000
@@ -159,8 +158,8 @@ def scan_code(filename: str, code: str, want_llm: bool) -> dict:
             mode = f"LLM ({agent.DEFAULT_MODEL}) + rules"
         except Exception as exc:  # never fail the request because the LLM failed
             mode = f"offline rules (LLM unavailable: {type(exc).__name__})"
-    merged = agent.merge(findings)
-    return {"mode": mode, "score": agent.risk_score(merged),
+    merged, suppressed = agent.apply_suppressions(agent.merge(findings), {rel: code})
+    return {"mode": mode, "score": agent.risk_score(merged), "suppressed": len(suppressed),
             "findings": [asdict(f) for f in merged]}
 
 
@@ -241,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def log_message(self, *_):
-        # Deliberately do not log request content or client addresses.
+        # sentinel:ignore[SLP005] deliberate no-op: never log request content or client addresses
         pass
 
 
@@ -250,7 +249,9 @@ def make_server(host: str = "0.0.0.0", port: int = 8000) -> ThreadingHTTPServer:
 
 
 if __name__ == "__main__":
-    load_env_file()
+    from dotenv import load_dotenv
+
+    load_dotenv()
     port = int(os.getenv("PORT", "8000"))
     print(f"CodeSentinel listening on http://localhost:{port}")
     make_server(port=port).serve_forever()

@@ -1,0 +1,16 @@
+const express = require("express");
+const app = express();
+const apiKey = process.env.API_KEY;
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+function save(file) {
+  try {
+    write(file);
+  } catch (e) {
+    console.error("write failed", e);
+    throw e;
+  }
+}

@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import re
 import sys
@@ -23,7 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from analyzers import analyze_python
-from env_loader import load_env_file
+from fixers import run_fixes, unified_diff
+from report import to_json, to_sarif
+from suppress import parse_suppressions
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -83,6 +86,7 @@ class Finding:
     source: str = "llm"   # llm | static
     rule: str = ""
     confidence: float = 0.0
+    end_line: int = 0
 
 
 @dataclass
@@ -102,7 +106,7 @@ def iter_files(root: Path):
         current = stack.pop()
         try:
             entries = sorted(current.iterdir(), key=lambda p: p.name)
-        except OSError:
+        except OSError:  # sentinel:ignore[GAP001] unreadable file is skipped on purpose
             continue
         for p in entries:
             if p.is_symlink():
@@ -263,7 +267,7 @@ def analyze_chunk(client, model: str, rel: str, lang: str, chunk: Chunk) -> list
                 cat = item.get("category", "gaps")
                 sev = item.get("severity", "info")
                 line = int(item.get("line", chunk.start))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # sentinel:ignore[GAP001] malformed model output is skipped; other chunks still report
                 continue
             out.append(Finding(
                 file=rel,
@@ -282,48 +286,69 @@ def analyze_chunk(client, model: str, rel: str, lang: str, chunk: Chunk) -> list
 # 4. Static safety net (AST + regex) - works offline, deterministic
 # --------------------------------------------------------------------------- #
 M = re.MULTILINE
+_MARKER = re.compile(r"\b(?:TODO|FIXME|HACK|XXX)\b")
 STATIC_RULES = [
-    # (category, severity, title, regex, fix)
-    ("security", "critical", "Hardcoded credential",
+    # (rule, category, severity, title, regex, fix, confidence)
+    ("SEC001", "security", "critical", "Hardcoded credential",
      re.compile(r"""(?i)(api[_-]?key|secret|passw(?:or)?d|token|private[_-]?key)\w*["']?\s*[:=]\s*["'][^"'\s]{6,}["']"""),
-     "Move to an environment variable or secrets manager and rotate the value."),
-    ("security", "critical", "AWS access key ID", re.compile(r"AKIA[0-9A-Z]{16}"),
-     "Revoke the key, rotate it, and load credentials from the environment/IAM role."),
-    ("security", "critical", "Private key committed",
+     "Move to an environment variable or secrets manager and rotate the value.", 0.8),
+    ("SEC001", "security", "critical", "AWS access key ID", re.compile(r"AKIA[0-9A-Z]{16}"),
+     "Revoke the key, rotate it, and load credentials from the environment/IAM role.", 0.95),
+    ("SEC001", "security", "critical", "Private key committed",
      re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
-     "Remove the key from the repo history and rotate it."),
-    ("security", "high", "Dynamic code execution (eval/exec)", re.compile(r"\b(?:eval|exec)\s*\("),
-     "Avoid eval/exec on dynamic input; use a safe parser or dispatch table."),
-    ("security", "high", "Possible SQL injection (string-built query)",
+     "Remove the key from the repo history and rotate it.", 0.95),
+    ("SEC003", "security", "high", "Dynamic code execution (eval/exec)", re.compile(r"\b(?:eval|exec)\s*\("),
+     "Avoid eval/exec on dynamic input; use a safe parser or dispatch table.", 0.7),
+    ("SEC004", "security", "high", "Possible SQL injection (string-built query)",
      re.compile(r"""(?i)(?:f["']\s*(?:select|insert|update|delete)\b[^\n]*\{|["']\s*(?:select|insert|update|delete)\b[^"'\n]*["']\s*(?:\+|%))"""),
-     "Use parameterized queries / prepared statements."),
-    ("security", "high", "Shell command with shell=True / exec of string",
+     "Use parameterized queries / prepared statements.", 0.6),
+    ("SEC003", "security", "high", "Shell command with shell=True / exec of string",
      re.compile(r"shell\s*=\s*True|os\.system\s*\(|child_process\.exec\s*\("),
-     "Pass an argument list without a shell and validate inputs."),
-    ("security", "medium", "TLS verification disabled",
+     "Pass an argument list without a shell and validate inputs.", 0.7),
+    ("SEC002", "security", "medium", "TLS verification disabled",
      re.compile(r"verify\s*=\s*False|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true"),
-     "Enable certificate verification."),
-    ("security", "medium", "Debug mode enabled", re.compile(r"(?i)\bdebug\s*[=:]\s*(?:True|true)\b"),
-     "Disable debug mode outside local development."),
-    ("gaps", "low", "TODO/FIXME marker", re.compile(r"\b(?:TODO|FIXME|HACK|XXX)\b"),
-     "Resolve it or track it in an issue."),
-    ("gaps", "medium", "Empty/swallowing exception handler",
+     "Enable certificate verification.", 0.8),
+    ("CFG001", "security", "medium", "Debug mode enabled", re.compile(r"(?i)\bdebug\s*[=:]\s*(?:True|true)\b"),
+     "Disable debug mode outside local development.", 0.7),
+    ("GAP004", "gaps", "low", "TODO/FIXME marker", _MARKER,
+     "Resolve it or track it in an issue.", 0.9),
+    ("GAP001", "gaps", "medium", "Empty/swallowing exception handler",
      re.compile(r"except[^\n:]*:[ \t]*\n[ \t]*(?:pass|\.\.\.)[ \t]*(?:#.*)?$|catch\s*(?:\([^)]*\))?\s*\{\s*(?://[^\n]*)?\s*\}", M),
-     "Log or handle the error; never swallow it silently."),
+     "Log or handle the error; never swallow it silently.", 0.7),
 ]
 
 
-def static_scan(rel: str, text: str) -> list[Finding]:
+AST_COVERED = {"SEC003", "SEC004", "GAP001"}
+
+
+def _marker_density(rel: str, text: str) -> list[Finding]:
+    lines = text.splitlines()
+    hits = [no for no, line in enumerate(lines, 1) if _MARKER.search(line)]
+    if len(hits) >= 3 and len(hits) * 100 / max(len(lines), 1) >= 5:
+        return [Finding(rel, hits[0], "slop", "low", f"{len(hits)} unresolved markers in {len(lines)} lines",
+                        "High density of TODO/FIXME-style markers.",
+                        "Resolve the markers or track them in an issue tracker.",
+                        "static", "SLP006", 0.8)]
+    return []
+
+
+def static_scan(rel: str, text: str, ctx: dict | None = None) -> list[Finding]:
     out: list[Finding] = []
     if rel.endswith(".py"):  # AST findings go first so they win ties in merge()
         out += [Finding(rel, r.line, r.category, r.severity, r.title, r.detail,
-                        r.fix, "static", r.rule, r.confidence)
-                for r in analyze_python(rel, text)]
-    for cat, sev, title, rx, fix in STATIC_RULES:
+                        r.fix, "static", r.rule, r.confidence, r.end_line)
+                for r in analyze_python(rel, text, ctx)]
+    is_py = rel.endswith(".py")
+    for rule, cat, sev, title, rx, fix, conf in STATIC_RULES:
+        if is_py and rule in AST_COVERED:  # the AST analyzers handle these precisely
+            continue
         for m in rx.finditer(text):
             line = text.count("\n", 0, m.start()) + 1
-            out.append(Finding(rel, line, cat, sev, title, "Matched by built-in pattern rule.", fix, "static"))
-    return out
+            if is_py and rule == "GAP004" and "#" not in text.splitlines()[line - 1].split(m.group(0))[0]:
+                continue  # in Python, only count markers that sit in comments
+            out.append(Finding(rel, line, cat, sev, title, "Matched by built-in pattern rule.",
+                               fix, "static", rule, conf))
+    return out + _marker_density(rel, text)
 
 
 def has_tests(rel_paths: list[str]) -> bool:
@@ -352,6 +377,29 @@ def merge(findings: list[Finding]) -> list[Finding]:
     return sorted(kept, key=lambda f: (SEV_RANK[f.severity], f.file, f.line))
 
 
+def apply_suppressions(findings: list[Finding], texts: dict[str, str]):
+    """Drop findings silenced by `sentinel:ignore[RULE] reason`. Returns (kept, suppressed)."""
+    parsed = {rel: parse_suppressions(text) for rel, text in texts.items()}
+    kept: list[Finding] = []
+    suppressed: list[Finding] = []
+    for rel, (_, bad_lines) in parsed.items():
+        for line in bad_lines:
+            kept.append(Finding(rel, line, "gaps", "medium", "Suppression without a reason",
+                                "`sentinel:ignore` needs rule IDs and a written reason; nothing was suppressed.",
+                                "Add the reason after the closing bracket.", "static", "SUP001", 1.0))
+    for f in findings:
+        valid = parsed.get(f.file, ({}, []))[0]
+        silenced = False
+        for line in (f.line, f.line - 1):
+            entry = valid.get(line)
+            if entry and f.rule and f.rule in entry[0] and (line == f.line or entry[2]):
+                silenced = True
+                break
+        (suppressed if silenced else kept).append(f)
+    kept.sort(key=lambda f: (SEV_RANK[f.severity], f.file, f.line))
+    return kept, suppressed
+
+
 def risk_score(findings: list[Finding]) -> int:
     return max(0, 100 - sum(SEV_WEIGHT[f.severity] for f in findings))
 
@@ -369,7 +417,8 @@ def render_terminal(findings: list[Finding], stats: dict) -> None:
     header = (
         f"[bold]Health score:[/] [{color}]{score}/100[/]   "
         f"[bold]Files:[/] {stats['files']}   [bold]Chunks:[/] {stats['chunks']}   "
-        f"[bold]Mode:[/] {stats['mode']}   [bold]Time:[/] {stats['elapsed']:.1f}s\n"
+        f"[bold]Mode:[/] {stats['mode']}   [bold]Suppressed:[/] {stats.get('suppressed', 0)}   "
+        f"[bold]Time:[/] {stats['elapsed']:.1f}s\n"
         + "  ".join(f"[{SEV_STYLE[s]}] {s.upper()} {n} [/]" for s, n in counts.items() if n)
     )
     console.print(Panel(header, title="CodeSentinel Report", border_style=color, box=box.ROUNDED))
@@ -381,6 +430,7 @@ def render_terminal(findings: list[Finding], stats: dict) -> None:
     table = Table(box=box.SIMPLE_HEAVY, show_lines=False, expand=True)
     table.add_column("Sev", no_wrap=True)
     table.add_column("Type", no_wrap=True)
+    table.add_column("Rule", no_wrap=True)
     table.add_column("Location", overflow="fold")
     table.add_column("Finding", ratio=1)
     for f in findings:
@@ -390,7 +440,7 @@ def render_terminal(findings: list[Finding], stats: dict) -> None:
         if f.fix:
             text += f"\n[green]Fix:[/] {f.fix}"
         table.add_row(f"[{SEV_STYLE[f.severity]}] {f.severity.upper()} [/]",
-                      CAT_LABEL[f.category], f"{f.file}:{f.line}", text)
+                      CAT_LABEL[f.category], f.rule or "LLM", f"{f.file}:{f.line}", text)
     console.print(table)
 
 
@@ -401,7 +451,8 @@ def render_markdown(findings: list[Finding], stats: dict, target: str) -> str:
         f"- **Target:** `{target}`",
         f"- **Health score:** {risk_score(findings)}/100",
         f"- **Files scanned:** {stats['files']} ({stats['chunks']} chunks)",
-        f"- **Mode:** {stats['mode']}", "",
+        f"- **Mode:** {stats['mode']}",
+        f"- **Suppressed findings:** {stats.get('suppressed', 0)}", "",
         "| Severity | Count |", "|---|---|",
         *[f"| {s} | {n} |" for s, n in counts.items()], "",
     ]
@@ -411,7 +462,8 @@ def render_markdown(findings: list[Finding], stats: dict, target: str) -> str:
         if not items:
             lines += ["_Nothing found._", ""]
         for f in items:
-            lines.append(f"- **[{f.severity.upper()}]** `{f.file}:{f.line}` - {f.title}")
+            rule = f" ({f.rule})" if f.rule else ""
+            lines.append(f"- **[{f.severity.upper()}]** `{f.file}:{f.line}` - {f.title}{rule}")
             if f.detail:
                 lines.append(f"  - {f.detail}")
             if f.fix:
@@ -428,7 +480,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("target", help="Directory (or single file) to scan")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Anthropic model (default: {DEFAULT_MODEL})")
     ap.add_argument("--report", metavar="FILE", help="Also write a Markdown report to FILE")
+    ap.add_argument("--format", choices=["text", "json", "sarif"], default="text",
+                    help="Output format on stdout (default: text)")
+    ap.add_argument("--exclude", default="", metavar="GLOBS",
+                    help="Comma-separated globs of relative paths to skip, e.g. 'tests,*.md'")
     ap.add_argument("--offline", action="store_true", help="Skip the LLM; run deterministic rules only")
+    ap.add_argument("--fix", action="store_true",
+                    help="Show verified fixes for Python files (dry run unless --apply)")
+    ap.add_argument("--apply", action="store_true", help="With --fix: write the verified fixes to disk")
     ap.add_argument("--workers", type=int, default=4, help="Parallel LLM requests (default 4)")
     ap.add_argument("--chunk-chars", type=int, default=CHUNK_CHARS)
     ap.add_argument("--max-files", type=int, default=MAX_FILES)
@@ -438,38 +497,89 @@ def parse_args(argv=None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def is_excluded(rel: str, patterns: list[str]) -> bool:
+    name = Path(rel).name
+    for pattern in patterns:
+        p = pattern.strip().rstrip("/")
+        if p and (fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(name, p) or rel.startswith(p + "/")):
+            return True
+    return False
+
+
+def read_declared(base: Path) -> set[str] | None:
+    """Package names declared in requirements*.txt, or None if there is no manifest."""
+    names: set[str] = set()
+    found = False
+    for manifest in sorted(base.glob("requirements*.txt")):
+        found = True
+        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.split("#")[0].strip()
+            m = re.match(r"[A-Za-z0-9_.\-]+", line) if line and not line.startswith(("-", "git+", "http")) else None
+            if m:
+                names.add(m.group(0))
+    return names if found else None
+
+
+def fix_files(base: Path, texts: dict[str, str], rels: list[str], ctx: dict, apply: bool) -> None:
+    def scan_fn(rel: str, text: str) -> list[Finding]:
+        kept, _ = apply_suppressions(merge(static_scan(rel, text, ctx)), {rel: text})
+        return kept
+
+    accepted = rejected = 0
+    for rel in rels:
+        if not rel.endswith(".py"):
+            continue
+        new, ok, bad = run_fixes(rel, texts[rel], scan_fn)
+        accepted, rejected = accepted + len(ok), rejected + len(bad)
+        for item in bad:
+            console.print(f"[yellow]rejected[/] {rel}:{item['line']} {item['rule']} - {item['reason']}")
+        if ok:
+            console.print(f"[bold]{rel}[/]: {len(ok)} verified fix(es)")
+            console.print(unified_diff(rel, texts[rel], new), markup=False, highlight=False)
+            if apply:
+                (base / rel).write_text(new, encoding="utf-8")
+    verdict = "written to disk" if apply and accepted else "dry run - add --apply to write them"
+    console.print(f"[bold]Fixes:[/] {accepted} accepted, {rejected} rejected ({verdict})")
+
+
 def main(argv=None) -> int:
+    global console
+    from dotenv import load_dotenv
     from rich.console import Console
     from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
-    load_env_file()
+    load_dotenv()
     console = Console()
     args = parse_args(argv)
+    if args.format != "text":
+        console = Console(stderr=True)  # keep stdout clean for machine-readable output
     target = Path(args.target).expanduser().resolve()
     if not target.exists():
         console.print(f"[red]Target not found:[/] {target}")
         return 2
 
-    files = collect_files(target, args.max_file_kb, args.max_files)
-    if not files:
+    base = target if target.is_dir() else target.parent
+    patterns = [p for p in args.exclude.split(",") if p.strip()]
+    pairs = [(p, p.relative_to(base).as_posix()) for p in collect_files(target, args.max_file_kb, 10**9)]
+    pairs = [(p, r) for p, r in pairs if not is_excluded(r, patterns)][:args.max_files]
+    if not pairs:
         console.print("[yellow]No scannable text files found.[/]")
         return 0
-    base = target if target.is_dir() else target.parent
-    rels = [p.relative_to(base).as_posix() for p in files]
+    files, rels = [p for p, _ in pairs], [r for _, r in pairs]
+    texts = {rel: path.read_text(encoding="utf-8", errors="replace") for path, rel in pairs}
+    ctx = {"local": {Path(r).parts[0].split(".")[0] for r in rels}, "declared": read_declared(base)}
 
-    use_llm = not args.offline and bool(os.getenv("ANTHROPIC_API_KEY"))
-    if not args.offline and not use_llm:
+    use_llm = not args.offline and not args.fix and bool(os.getenv("ANTHROPIC_API_KEY"))
+    if not args.offline and not args.fix and not use_llm:
         console.print("[yellow]ANTHROPIC_API_KEY not set - falling back to offline mode.[/]")
 
     start = time.time()
     findings: list[Finding] = []
     jobs: list[tuple[str, str, Chunk]] = []
-
-    for path, rel in zip(files, rels):
-        text = path.read_text(encoding="utf-8", errors="replace")
-        findings += static_scan(rel, text)
+    for path, rel in pairs:
+        findings += static_scan(rel, texts[rel], ctx)
         lang = LANG_BY_EXT.get(path.suffix.lower(), "unknown (infer from content)")
-        for ch in chunk_text(text, args.chunk_chars):
+        for ch in chunk_text(texts[rel], args.chunk_chars):
             jobs.append((rel, lang, ch))
 
     if target.is_dir() and not has_tests(rels) and any(
@@ -477,7 +587,7 @@ def main(argv=None) -> int:
             for p in files):
         findings.append(Finding("<project>", 1, "gaps", "medium", "No tests found",
                                 "No test files or test directories were detected.",
-                                "Add unit tests for the core logic.", "static"))
+                                "Add unit tests for the core logic.", "static", "GAP005", 0.9))
 
     console.print(f"[bold]Scanning[/] {target}  ->  {len(files)} files, {len(jobs)} chunks")
     errors: list[str] = []
@@ -504,12 +614,18 @@ def main(argv=None) -> int:
             console.print("[red]Invalid ANTHROPIC_API_KEY - results below are rule-based only.[/]")
             use_llm = False
 
-    merged = merge(findings)
+    merged, suppressed = apply_suppressions(merge(findings), texts)
     stats = {
         "files": len(files), "chunks": len(jobs), "elapsed": time.time() - start,
+        "suppressed": len(suppressed),
         "mode": f"LLM ({args.model}) + rules" if use_llm else "offline rules",
     }
-    render_terminal(merged, stats)
+    if args.format == "json":
+        print(to_json(merged, stats, str(target)))
+    elif args.format == "sarif":
+        print(to_sarif(merged, str(target)))
+    else:
+        render_terminal(merged, stats)
     for e in errors[:5]:
         console.print(f"[dim yellow]warning: {e}[/]")
 
@@ -518,6 +634,9 @@ def main(argv=None) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(render_markdown(merged, stats, str(target)), encoding="utf-8")
         console.print(f"[bold]Markdown report written to[/] {out}")
+
+    if args.fix:
+        fix_files(base, texts, rels, ctx, args.apply)
 
     if args.fail_on != "none":
         limit = SEV_RANK[args.fail_on]

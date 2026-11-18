@@ -1,0 +1,41 @@
+import os
+import sys
+import sqlite3
+import hashlib
+import requests
+
+
+def find_item(db, name):
+    return db.execute("SELECT * FROM items WHERE name = '" + name + "'").fetchall()
+
+
+def run_report(path):
+    os.system("cat " + path)
+
+
+def fingerprint(data):
+    return hashlib.md5(data).hexdigest()
+
+
+def fetch_prices(url):
+    return requests.get(url).json()
+
+
+def load(path):
+    try:
+        return open(path).read()
+    except Exception:
+        pass
+
+
+def total(items):
+    return sum(items)
+    print("done")
+
+
+# legacy = compute_old(items)
+# legacy2 = legacy + 1
+
+
+def not_done():
+    pass
