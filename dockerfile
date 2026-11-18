@@ -9,12 +9,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY agent.py .
+COPY agent.py app.py test_agent.py ./
 COPY dummy_target ./dummy_target
 
 RUN useradd --create-home sentinel && mkdir /out && chown sentinel /out
 USER sentinel
 
-# `docker run ... codesentinel` scans the bundled demo by default.
+EXPOSE 8000
+
+# Default: CLI scan of the bundled demo.
 ENTRYPOINT ["python", "agent.py"]
 CMD ["dummy_target"]
