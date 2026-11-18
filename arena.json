@@ -1,0 +1,12 @@
+{
+  "name": "CodeSentinel",
+  "description": "Language-agnostic AI code triage: flags security risks, code slop and loose ends with exact file/line and fixes.",
+  "track": "DevTools",
+  "author": "Geetanjali Kota",
+  "entrypoint": "agent.py",
+  "install": "pip install -r requirements.txt",
+  "run": "python agent.py ./dummy_target --offline",
+  "docker": "docker build -t codesentinel . && docker run --rm -it codesentinel dummy_target --offline",
+  "requires_api_key": false,
+  "optional_env": ["ANTHROPIC_API_KEY"]
+}
